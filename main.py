@@ -369,19 +369,33 @@ def should_process_topic(topic: Topic, cfg: Config) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 AI_SYSTEM_PROMPT = (
-    "You are an expert Roblox developer assistant. Analyze Roblox DevForum "
-    "posts for a Roblox game developer. Write in Brazilian Portuguese. Be "
-    "practical, concise, and highlight concrete impact."
+    "Você é um engenheiro sênior de Roblox/Luau analisando posts do DevForum "
+    "para outro desenvolvedor experiente. Escreva em português do Brasil, com "
+    "linguagem técnica, direta e sem encher linguiça. Cite nomes EXATOS de "
+    "APIs, serviços, propriedades, classes, eventos e flags do Roblox quando "
+    "aparecerem (ex.: DataStoreService, MemoryStoreService, BindToClose, "
+    "StreamingEnabled, Workspace.SignalBehavior, HumanoidDescription). Quando "
+    "o post mencionar limites, cotas, preços (Robux/USD), porcentagens, "
+    "datas, versões, IDs, números de tickets ou prazos, REPRODUZA os valores "
+    "literais. Quando o post citar exemplos de código, descreva-os "
+    "tecnicamente. Quando houver links relevantes (documentação, anúncios, "
+    "tópicos relacionados, posts antigos), inclua-os. Se algo não estiver no "
+    "post, não invente — diga 'não informado'."
 )
 
-AI_JSON_SCHEMA_TEXT = """Responda APENAS com JSON válido neste schema:
+AI_JSON_SCHEMA_TEXT = """Responda APENAS com JSON válido (sem markdown, sem ```), neste schema:
 {
-  "summary": "string (resumo curto em pt-BR)",
-  "context": "string (contexto da mudança/notícia)",
-  "impact": "string (por que importa para devs Roblox e impacto em jogos)",
-  "recommended_action": "string (ação recomendada)",
+  "summary": "string — resumo objetivo em 2-4 frases",
+  "context": "string — contexto técnico: o que era antes, o que está mudando, qual o estado atual (beta/live/deprecated etc). Cite nomes de APIs/serviços EXATOS.",
+  "key_points": ["string", ...] (3-8 bullets com os pontos técnicos importantes: nomes de APIs, métodos, propriedades, limites, comportamentos novos/quebrados),
+  "examples": ["string", ...] (0-5 exemplos concretos citados no post: cenários de uso, snippets descritos em palavras, casos de borda),
+  "dates": ["string", ...] (0-6 datas/prazos relevantes em formato 'YYYY-MM-DD — descrição' OU 'descrição livre se sem data exata'),
+  "values": ["string", ...] (0-8 números/limites/preços/cotas literais, ex.: 'DataStore: 4MB por chave', 'Custo: 100 Robux', 'Limite: 30 req/min'),
+  "impact": "string — impacto concreto em jogos Roblox: o que quebra, o que melhora, quem precisa agir",
+  "recommended_action": "string — ação prática recomendada agora",
   "urgency": "Low | Medium | High | Critical",
-  "developer_notes": "string (notas técnicas relevantes)"
+  "developer_notes": "string — notas técnicas extras, gotchas, incompatibilidades, dependências",
+  "links": ["string", ...] (0-8 URLs relevantes citados no post; use as URLs EXATAS — não invente)
 }"""
 
 
@@ -394,13 +408,51 @@ def _extract_first_post(details: dict[str, Any]) -> tuple[str, dict[str, Any] | 
     return clean_html(cooked), first
 
 
-def _build_user_prompt(topic: Topic, details: dict[str, Any] | None) -> str:
+_HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
+_BORING_LINK_HOSTS = (
+    "devforum.roblox.com/u/",
+    "/badges/",
+    "/login",
+    "/signup",
+)
+
+
+def _extract_links(html_raw: str | None, base_url: str) -> list[str]:
+    """Pull hrefs out of cooked HTML before stripping tags. Dedupe + dropping noise."""
+    if not html_raw:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for href in _HREF_RE.findall(html_raw):
+        if href.startswith("/"):
+            href = base_url.rstrip("/") + href
+        if not href.startswith(("http://", "https://")):
+            continue
+        if any(b in href for b in _BORING_LINK_HOSTS):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        out.append(href)
+        if len(out) >= 12:
+            break
+    return out
+
+
+def _build_user_prompt(
+    topic: Topic,
+    details: dict[str, Any] | None,
+    base_url: str,
+) -> str:
     body = ""
+    raw_cooked = ""
     created = topic.created_at
     if details:
         body, first = _extract_first_post(details)
-        if first and first.get("created_at"):
-            created = first.get("created_at")
+        if first:
+            raw_cooked = first.get("cooked") or ""
+            if first.get("created_at"):
+                created = first.get("created_at")
         category = details.get("category_id") or topic.category_id
         tags = details.get("tags") or topic.tags
     else:
@@ -408,8 +460,11 @@ def _build_user_prompt(topic: Topic, details: dict[str, Any] | None) -> str:
         tags = topic.tags
 
     body = body or topic.excerpt or ""
-    if len(body) > 6000:
-        body = body[:6000] + "…"
+    if len(body) > 9000:
+        body = body[:9000] + "…"
+
+    links = _extract_links(raw_cooked, base_url)
+    links_block = "\n".join(f"- {u}" for u in links) if links else "(nenhum)"
 
     return (
         f"Título: {topic.title}\n"
@@ -418,8 +473,13 @@ def _build_user_prompt(topic: Topic, details: dict[str, Any] | None) -> str:
         f"Tags: {', '.join(tags) if tags else '(nenhuma)'}\n"
         f"Criado em: {created}\n"
         f"Bumped em: {topic.bumped_at}\n"
+        f"Curtidas: {topic.like_count}\n"
         f"Excerpt: {topic.excerpt or '(sem excerpt)'}\n"
+        f"\n--- Links encontrados no post (use no campo links se relevantes) ---\n{links_block}\n"
         f"\n--- Conteúdo do post ---\n{body}\n"
+        f"\nInstruções: extraia detalhes técnicos máximos. Cite nomes exatos de "
+        f"APIs/serviços/propriedades. Preserve números, limites, datas, IDs, "
+        f"valores em Robux/USD, versões e prazos LITERALMENTE como aparecem.\n"
         f"\n{AI_JSON_SCHEMA_TEXT}"
     )
 
@@ -442,17 +502,27 @@ def _parse_ai_json(content: str) -> dict[str, Any] | None:
     return None
 
 
-def _fallback_analysis(topic: Topic, body_preview: str, reason: str) -> dict[str, Any]:
+def _fallback_analysis(
+    topic: Topic,
+    body_preview: str,
+    reason: str,
+    links: list[str] | None = None,
+) -> dict[str, Any]:
     excerpt = (body_preview or topic.excerpt or "").strip()
     if len(excerpt) > 500:
         excerpt = excerpt[:500] + "…"
     return {
         "summary": excerpt or topic.title,
         "context": "Análise automática indisponível — exibindo trecho original.",
+        "key_points": [],
+        "examples": [],
+        "dates": [],
+        "values": [],
         "impact": "Avaliar manualmente abrindo o link.",
         "recommended_action": "Abrir o tópico e revisar com atenção.",
         "urgency": "Low",
         "developer_notes": f"Falha na IA: {reason}",
+        "links": links or [],
     }
 
 
@@ -551,9 +621,39 @@ _PROVIDER_DISPATCH = {
 }
 
 
+def _coerce_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return [str(value)]
+
+
+def _normalize_analysis(parsed: dict[str, Any]) -> dict[str, Any]:
+    for key in ("key_points", "examples", "dates", "values", "links"):
+        parsed[key] = _coerce_list(parsed.get(key))
+    urgency = parsed.get("urgency", "Low")
+    if urgency not in URGENCY_COLORS:
+        parsed["urgency"] = "Low"
+    for key in ("summary", "context", "impact", "recommended_action", "developer_notes"):
+        if not isinstance(parsed.get(key), str):
+            parsed[key] = "" if parsed.get(key) is None else str(parsed[key])
+    return parsed
+
+
 def analyze_with_ai(cfg: Config, topic: Topic, details: dict[str, Any] | None) -> dict[str, Any]:
-    user_prompt = _build_user_prompt(topic, details)
-    body_preview = _extract_first_post(details)[0] if details else (topic.excerpt or "")
+    user_prompt = _build_user_prompt(topic, details, cfg.devforum_base_url)
+    raw_cooked = ""
+    body_preview = ""
+    if details:
+        body_preview, first = _extract_first_post(details)
+        if first:
+            raw_cooked = first.get("cooked") or ""
+    else:
+        body_preview = topic.excerpt or ""
+    extracted_links = _extract_links(raw_cooked, cfg.devforum_base_url)
     call = _PROVIDER_DISPATCH[cfg.ai_provider]
     last_error = "unknown"
 
@@ -562,9 +662,10 @@ def analyze_with_ai(cfg: Config, topic: Topic, details: dict[str, Any] | None) -
             content = call(cfg, user_prompt)
             parsed = _parse_ai_json(content)
             if parsed and parsed.get("summary"):
-                urgency = parsed.get("urgency", "Low")
-                if urgency not in URGENCY_COLORS:
-                    parsed["urgency"] = "Low"
+                parsed = _normalize_analysis(parsed)
+                # Make sure the post's real links survive even if the model omitted them.
+                if not parsed["links"]:
+                    parsed["links"] = extracted_links
                 return parsed
             last_error = "JSON inválido retornado pelo modelo"
             log.warning("[%s] AI returned unparseable JSON on attempt %d: %s",
@@ -575,7 +676,7 @@ def analyze_with_ai(cfg: Config, topic: Topic, details: dict[str, Any] | None) -
                       cfg.ai_provider, attempt, last_error)
             time.sleep(2)
 
-    return _fallback_analysis(topic, body_preview, last_error)
+    return _fallback_analysis(topic, body_preview, last_error, extracted_links)
 
 
 # ---------------------------------------------------------------------------
@@ -589,33 +690,92 @@ def _truncate(text: str | None, limit: int) -> str:
     return text[: limit - 1] + "…"
 
 
+def _format_bullets(items: list[str], *, max_chars: int = 1024,
+                    max_items: int = 8, bullet: str = "•") -> str:
+    """Join list items as bullets, respecting Discord's 1024-char field limit."""
+    if not items:
+        return ""
+    out_lines: list[str] = []
+    used = 0
+    shown = 0
+    for raw in items:
+        if shown >= max_items:
+            break
+        line = f"{bullet} {raw.strip()}"
+        # Reserve room for separator and possible '…' suffix.
+        if used + len(line) + 2 > max_chars - 2:
+            break
+        out_lines.append(line)
+        used += len(line) + 1
+        shown += 1
+    if shown < len(items):
+        out_lines.append(f"… (+{len(items) - shown})")
+    return "\n".join(out_lines)
+
+
+def _format_links(items: list[str], max_chars: int = 1024, max_items: int = 6) -> str:
+    if not items:
+        return ""
+    lines: list[str] = []
+    used = 0
+    shown = 0
+    for url in items:
+        if shown >= max_items:
+            break
+        line = f"• <{url.strip()}>"
+        if used + len(line) + 2 > max_chars - 2:
+            break
+        lines.append(line)
+        used += len(line) + 1
+        shown += 1
+    if shown < len(items):
+        lines.append(f"… (+{len(items) - shown})")
+    return "\n".join(lines)
+
+
+def _add_field(fields: list[dict[str, Any]], name: str, value: str,
+               *, inline: bool = False) -> None:
+    if not value:
+        return
+    fields.append({"name": name, "value": _truncate(value, 1024), "inline": inline})
+
+
 def send_discord_embed(cfg: Config, topic: Topic, analysis: dict[str, Any]) -> bool:
     urgency = analysis.get("urgency", "Low")
     color = URGENCY_COLORS.get(urgency, URGENCY_COLORS["Low"])
     urgency_label = URGENCY_PT.get(urgency, urgency)
+
+    fields: list[dict[str, Any]] = []
+    _add_field(fields, "Título", topic.title)
+    _add_field(fields, "Urgência", urgency_label, inline=True)
+    _add_field(fields, "Categoria/Tags",
+               ", ".join(topic.tags) or "—", inline=True)
+    _add_field(fields, "Curtidas", f"❤ {topic.like_count}", inline=True)
+
+    _add_field(fields, "📝 Resumo", analysis.get("summary", ""))
+    _add_field(fields, "🧭 Contexto", analysis.get("context", ""))
+    _add_field(fields, "🔑 Pontos principais",
+               _format_bullets(analysis.get("key_points") or []))
+    _add_field(fields, "💡 Exemplos / casos",
+               _format_bullets(analysis.get("examples") or []))
+    _add_field(fields, "📅 Datas / prazos",
+               _format_bullets(analysis.get("dates") or [], bullet="📅"))
+    _add_field(fields, "📊 Valores / limites",
+               _format_bullets(analysis.get("values") or [], bullet="•"))
+    _add_field(fields, "💥 Impacto para jogos Roblox", analysis.get("impact", ""))
+    _add_field(fields, "✅ Ação recomendada", analysis.get("recommended_action", ""))
+    _add_field(fields, "🛠 Notas técnicas", analysis.get("developer_notes", ""))
+    _add_field(fields, "🔗 Links relacionados",
+               _format_links(analysis.get("links") or []))
+    _add_field(fields, "Referência", topic.url)
 
     embed = {
         "title": "📰 Novo post no Roblox DevForum",
         "url": topic.url,
         "color": color,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "fields": [
-            {"name": "Título", "value": _truncate(topic.title, 1024), "inline": False},
-            {"name": "Urgência", "value": urgency_label, "inline": True},
-            {"name": "Categoria/Tags",
-             "value": _truncate(", ".join(topic.tags) or "—", 1024), "inline": True},
-            {"name": "Curtidas", "value": f"❤ {topic.like_count}", "inline": True},
-            {"name": "Resumo", "value": _truncate(analysis.get("summary"), 1024), "inline": False},
-            {"name": "Contexto", "value": _truncate(analysis.get("context"), 1024), "inline": False},
-            {"name": "Impacto para jogos Roblox",
-             "value": _truncate(analysis.get("impact"), 1024), "inline": False},
-            {"name": "Ação recomendada",
-             "value": _truncate(analysis.get("recommended_action"), 1024), "inline": False},
-            {"name": "Notas técnicas",
-             "value": _truncate(analysis.get("developer_notes"), 1024), "inline": False},
-            {"name": "Referência", "value": topic.url, "inline": False},
-        ],
-        "footer": {"text": "Roblox DevForum Monitor • AI summary"},
+        "fields": fields[:25],  # Discord hard limit
+        "footer": {"text": f"Roblox DevForum Monitor • {cfg.ai_provider}/{cfg.active_model}"},
     }
 
     payload = {"embeds": [embed]}

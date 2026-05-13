@@ -73,6 +73,8 @@ class Config:
     ignore_keywords: list[str]
     max_topics_per_check: int
     database_path: str
+    min_likes_default: int = 0
+    min_likes_by_category: dict[int, int] = field(default_factory=dict)
     port: int = 8080
     healthcheck_enabled: bool = True
     _client: OpenAI | None = field(default=None, repr=False)
@@ -102,6 +104,16 @@ def load_config() -> Config:
 
     endpoints = _csv(os.environ.get("MONITORED_ENDPOINTS")) or ["/latest.json"]
 
+    min_likes_map: dict[int, int] = {}
+    for pair in _csv(os.environ.get("MIN_LIKES_BY_CATEGORY")):
+        if "=" not in pair:
+            continue
+        cat_str, val_str = pair.split("=", 1)
+        try:
+            min_likes_map[int(cat_str.strip())] = int(val_str.strip())
+        except ValueError:
+            log.warning("Ignoring bad MIN_LIKES_BY_CATEGORY entry: %r", pair)
+
     cfg = Config(
         discord_webhook_url=webhook,
         openai_api_key=openai_key,
@@ -113,18 +125,23 @@ def load_config() -> Config:
         ignore_keywords=[k.lower() for k in _csv(os.environ.get("IGNORE_KEYWORDS"))],
         max_topics_per_check=max(1, int(os.environ.get("MAX_TOPICS_PER_CHECK", "20"))),
         database_path=os.environ.get("DATABASE_PATH", "./data/devforum_bot.sqlite3"),
+        min_likes_default=max(0, int(os.environ.get("MIN_LIKES", "0"))),
+        min_likes_by_category=min_likes_map,
         port=int(os.environ.get("PORT", "8080")),
         healthcheck_enabled=os.environ.get("HEALTHCHECK", "1") != "0",
     )
 
     log.info(
-        "Loaded config: model=%s, interval=%dmin, endpoints=%s, keywords=%d, ignore=%d, max=%d",
+        "Loaded config: model=%s, interval=%dmin, endpoints=%s, keywords=%d, ignore=%d, "
+        "max=%d, min_likes=%d, min_likes_by_cat=%s",
         cfg.openai_model,
         cfg.check_interval_minutes,
         cfg.monitored_endpoints,
         len(cfg.keywords),
         len(cfg.ignore_keywords),
         cfg.max_topics_per_check,
+        cfg.min_likes_default,
+        cfg.min_likes_by_category,
     )
     return cfg
 
@@ -236,6 +253,7 @@ class Topic:
     created_at: str | None
     bumped_at: str | None
     excerpt: str | None
+    like_count: int = 0
 
 
 def get_latest_topics(cfg: Config, endpoint: str) -> list[Topic]:
@@ -251,6 +269,12 @@ def get_latest_topics(cfg: Config, endpoint: str) -> list[Topic]:
             topic_id = int(raw["id"])
             slug = raw.get("slug") or str(topic_id)
             topic_url = f"{cfg.devforum_base_url}/t/{slug}/{topic_id}"
+            like_count = int(
+                raw.get("like_count")
+                or raw.get("op_like_count")
+                or raw.get("thumbs_up_count")
+                or 0
+            )
             topics.append(Topic(
                 topic_id=topic_id,
                 title=raw.get("title") or "",
@@ -261,6 +285,7 @@ def get_latest_topics(cfg: Config, endpoint: str) -> list[Topic]:
                 created_at=raw.get("created_at"),
                 bumped_at=raw.get("bumped_at"),
                 excerpt=raw.get("excerpt"),
+                like_count=like_count,
             ))
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("Skipping malformed topic in %s: %s", endpoint, exc)
@@ -288,13 +313,26 @@ def _haystack(topic: Topic) -> str:
     return " ".join(parts).lower()
 
 
-def should_process_topic(topic: Topic, cfg: Config) -> bool:
+def min_likes_for(cfg: Config, category_id: int | None) -> int:
+    if category_id is not None and category_id in cfg.min_likes_by_category:
+        return cfg.min_likes_by_category[category_id]
+    return cfg.min_likes_default
+
+
+def should_process_topic(topic: Topic, cfg: Config) -> tuple[bool, str]:
+    """Return (accept, reason). reason='likes' means try again later."""
     text = _haystack(topic)
     if cfg.ignore_keywords and any(k in text for k in cfg.ignore_keywords):
-        return False
-    if not cfg.keywords:
-        return True
-    return any(k in text for k in cfg.keywords)
+        return False, "ignored"
+
+    if cfg.keywords and not any(k in text for k in cfg.keywords):
+        return False, "no_keyword"
+
+    required_likes = min_likes_for(cfg, topic.category_id)
+    if required_likes > 0 and topic.like_count < required_likes:
+        return False, "likes"
+
+    return True, "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -375,19 +413,24 @@ def _parse_ai_json(content: str) -> dict[str, Any] | None:
     return None
 
 
-def _fallback_analysis(topic: Topic, raw_text: str | None) -> dict[str, Any]:
+def _fallback_analysis(topic: Topic, body_preview: str, reason: str) -> dict[str, Any]:
+    excerpt = (body_preview or topic.excerpt or "").strip()
+    if len(excerpt) > 500:
+        excerpt = excerpt[:500] + "…"
     return {
-        "summary": (raw_text or topic.title)[:500],
-        "context": "Análise automática indisponível, exibindo conteúdo bruto.",
-        "impact": "Avaliar manualmente o impacto.",
-        "recommended_action": "Abrir o link e revisar com atenção.",
+        "summary": excerpt or topic.title,
+        "context": "Análise automática indisponível — exibindo trecho original.",
+        "impact": "Avaliar manualmente abrindo o link.",
+        "recommended_action": "Abrir o tópico e revisar com atenção.",
         "urgency": "Low",
-        "developer_notes": "Falha na análise de IA, fallback acionado.",
+        "developer_notes": f"Falha na IA: {reason}",
     }
 
 
 def analyze_with_ai(cfg: Config, topic: Topic, details: dict[str, Any] | None) -> dict[str, Any]:
     user_prompt = _build_user_prompt(topic, details)
+    body_preview = _extract_first_post(details)[0] if details else (topic.excerpt or "")
+    last_error = "unknown"
 
     for attempt in (1, 2):
         try:
@@ -407,12 +450,15 @@ def analyze_with_ai(cfg: Config, topic: Topic, details: dict[str, Any] | None) -
                 if urgency not in URGENCY_COLORS:
                     parsed["urgency"] = "Low"
                 return parsed
-            log.warning("AI returned unparseable JSON on attempt %d", attempt)
+            last_error = "JSON inválido retornado pelo modelo"
+            log.warning("AI returned unparseable JSON on attempt %d: %s",
+                        attempt, content[:300])
         except Exception as exc:  # broad: OpenAI lib can raise many subclasses
-            log.error("AI call failed (attempt %d): %s", attempt, exc)
+            last_error = f"{type(exc).__name__}: {exc}"
+            log.error("AI call failed (attempt %d): %s", attempt, last_error)
             time.sleep(2)
 
-    return _fallback_analysis(topic, _build_user_prompt(topic, details))
+    return _fallback_analysis(topic, body_preview, last_error)
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +487,7 @@ def send_discord_embed(cfg: Config, topic: Topic, analysis: dict[str, Any]) -> b
             {"name": "Urgência", "value": urgency_label, "inline": True},
             {"name": "Categoria/Tags",
              "value": _truncate(", ".join(topic.tags) or "—", 1024), "inline": True},
+            {"name": "Curtidas", "value": f"❤ {topic.like_count}", "inline": True},
             {"name": "Resumo", "value": _truncate(analysis.get("summary"), 1024), "inline": False},
             {"name": "Contexto", "value": _truncate(analysis.get("context"), 1024), "inline": False},
             {"name": "Impacto para jogos Roblox",
@@ -532,14 +579,20 @@ def process_once(cfg: Config, conn: sqlite3.Connection) -> None:
 
     new_count = 0
     skip_count = 0
+    pending_count = 0
     for topic in _iter_unique_topics(all_topics):
         item_id = f"topic:{topic.topic_id}"
         if is_already_processed(conn, item_id):
             continue
-        if not should_process_topic(topic, cfg):
+        accept, reason = should_process_topic(topic, cfg)
+        if not accept:
+            if reason == "likes":
+                # Don't persist — likes may rise; re-evaluate next cycle.
+                pending_count += 1
+                continue
             mark_processed(
                 conn,
-                item_type="topic_skipped",
+                item_type=f"topic_skipped:{reason}",
                 item_id=item_id,
                 topic_id=str(topic.topic_id),
                 title=topic.title,
@@ -548,7 +601,8 @@ def process_once(cfg: Config, conn: sqlite3.Connection) -> None:
             skip_count += 1
             continue
 
-        log.info("Analyzing topic %d: %s", topic.topic_id, topic.title)
+        log.info("Analyzing topic %d (cat=%s, likes=%d): %s",
+                 topic.topic_id, topic.category_id, topic.like_count, topic.title)
         details = fetch_topic_details(cfg, topic)
         analysis = analyze_with_ai(cfg, topic, details)
 
@@ -566,8 +620,8 @@ def process_once(cfg: Config, conn: sqlite3.Connection) -> None:
         else:
             log.error("Discord send failed for topic %d, will retry next cycle", topic.topic_id)
 
-    log.info("Cycle done: %d sent, %d filtered, %d total fetched",
-             new_count, skip_count, len(all_topics))
+    log.info("Cycle done: %d sent, %d filtered, %d under likes threshold, %d total fetched",
+             new_count, skip_count, pending_count, len(all_topics))
 
 
 def main_loop() -> None:

@@ -36,6 +36,8 @@ The first cycle will mark recent topics from the configured endpoints. Only item
 | `MONITORED_ENDPOINTS` | `/latest.json` | Comma-separated Discourse JSON endpoints |
 | `KEYWORDS` | *(empty = accept all)* | Comma-separated keywords matched against title/excerpt/tags |
 | `IGNORE_KEYWORDS` | *(empty)* | Comma-separated keywords to skip |
+| `MIN_LIKES` | `0` | Minimum likes for any topic to be forwarded (fallback) |
+| `MIN_LIKES_BY_CATEGORY` | *(empty)* | Per-category likes threshold. Format: `45=0,17=15` (Updates=any, Resources=15+) |
 | `MAX_TOPICS_PER_CHECK` | `20` | Max topics processed per endpoint per cycle |
 | `DATABASE_PATH` | `./data/devforum_bot.sqlite3` | SQLite file path |
 | `PORT` | `8080` | Port for the healthcheck HTTP server |

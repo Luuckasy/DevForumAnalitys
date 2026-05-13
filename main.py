@@ -23,7 +23,6 @@ from typing import Any, Iterable
 
 import requests
 from dotenv import load_dotenv
-from openai import OpenAI
 
 
 # ---------------------------------------------------------------------------
@@ -61,11 +60,19 @@ HTTP_TIMEOUT = 20
 USER_AGENT = "RobloxDevForumMonitor/1.0 (+https://github.com/)"
 
 
+VALID_PROVIDERS = ("openai", "gemini", "groq")
+
+
 @dataclass
 class Config:
     discord_webhook_url: str
+    ai_provider: str
     openai_api_key: str
     openai_model: str
+    gemini_api_key: str
+    gemini_model: str
+    groq_api_key: str
+    groq_model: str
     check_interval_minutes: int
     devforum_base_url: str
     monitored_endpoints: list[str]
@@ -77,13 +84,15 @@ class Config:
     min_likes_by_category: dict[int, int] = field(default_factory=dict)
     port: int = 8080
     healthcheck_enabled: bool = True
-    _client: OpenAI | None = field(default=None, repr=False)
+    _ai_client: Any = field(default=None, repr=False)
 
     @property
-    def openai(self) -> OpenAI:
-        if self._client is None:
-            self._client = OpenAI(api_key=self.openai_api_key)
-        return self._client
+    def active_model(self) -> str:
+        return {
+            "openai": self.openai_model,
+            "gemini": self.gemini_model,
+            "groq": self.groq_model,
+        }[self.ai_provider]
 
 
 def _csv(value: str | None) -> list[str]:
@@ -96,11 +105,25 @@ def load_config() -> Config:
     load_dotenv()
 
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not webhook:
         raise RuntimeError("DISCORD_WEBHOOK_URL is required")
-    if not openai_key:
-        raise RuntimeError("OPENAI_API_KEY is required")
+
+    provider = os.environ.get("AI_PROVIDER", "gemini").strip().lower()
+    if provider not in VALID_PROVIDERS:
+        raise RuntimeError(
+            f"AI_PROVIDER must be one of {VALID_PROVIDERS}, got {provider!r}"
+        )
+
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+
+    required_key = {"openai": openai_key, "gemini": gemini_key, "groq": groq_key}[provider]
+    if not required_key:
+        raise RuntimeError(
+            f"AI_PROVIDER={provider} requires "
+            f"{provider.upper()}_API_KEY to be set"
+        )
 
     endpoints = _csv(os.environ.get("MONITORED_ENDPOINTS")) or ["/latest.json"]
 
@@ -116,8 +139,13 @@ def load_config() -> Config:
 
     cfg = Config(
         discord_webhook_url=webhook,
+        ai_provider=provider,
         openai_api_key=openai_key,
         openai_model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip(),
+        gemini_api_key=gemini_key,
+        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip(),
+        groq_api_key=groq_key,
+        groq_model=os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant").strip(),
         check_interval_minutes=max(1, int(os.environ.get("CHECK_INTERVAL_MINUTES", "10"))),
         devforum_base_url=os.environ.get("DEVFORUM_BASE_URL", "https://devforum.roblox.com").rstrip("/"),
         monitored_endpoints=endpoints,
@@ -132,9 +160,10 @@ def load_config() -> Config:
     )
 
     log.info(
-        "Loaded config: model=%s, interval=%dmin, endpoints=%s, keywords=%d, ignore=%d, "
-        "max=%d, min_likes=%d, min_likes_by_cat=%s",
-        cfg.openai_model,
+        "Loaded config: provider=%s, model=%s, interval=%dmin, endpoints=%s, "
+        "keywords=%d, ignore=%d, max=%d, min_likes=%d, min_likes_by_cat=%s",
+        cfg.ai_provider,
+        cfg.active_model,
         cfg.check_interval_minutes,
         cfg.monitored_endpoints,
         len(cfg.keywords),
@@ -427,23 +456,110 @@ def _fallback_analysis(topic: Topic, body_preview: str, reason: str) -> dict[str
     }
 
 
+def _get_openai_client(cfg: Config, *, base_url: str | None = None, api_key: str):
+    """Lazy-import the OpenAI SDK (used by both 'openai' and 'groq' providers)."""
+    if cfg._ai_client is None:
+        try:
+            from openai import OpenAI  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "openai package is required for OpenAI/Groq providers. "
+                "Install with `pip install openai`."
+            ) from exc
+        cfg._ai_client = OpenAI(api_key=api_key, base_url=base_url)
+    return cfg._ai_client
+
+
+def _call_openai_compat(cfg: Config, user_prompt: str, *, base_url: str | None,
+                        api_key: str, model: str, use_json_mode: bool) -> str:
+    client = _get_openai_client(cfg, base_url=base_url, api_key=api_key)
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": AI_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+    }
+    if use_json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    resp = client.chat.completions.create(**kwargs)
+    return resp.choices[0].message.content or ""
+
+
+def _call_openai(cfg: Config, user_prompt: str) -> str:
+    return _call_openai_compat(
+        cfg, user_prompt,
+        base_url=None,
+        api_key=cfg.openai_api_key,
+        model=cfg.openai_model,
+        use_json_mode=True,
+    )
+
+
+def _call_groq(cfg: Config, user_prompt: str) -> str:
+    # Groq exposes an OpenAI-compatible endpoint and supports JSON mode.
+    return _call_openai_compat(
+        cfg, user_prompt,
+        base_url="https://api.groq.com/openai/v1",
+        api_key=cfg.groq_api_key,
+        model=cfg.groq_model,
+        use_json_mode=True,
+    )
+
+
+def _call_gemini(cfg: Config, user_prompt: str) -> str:
+    if cfg._ai_client is None:
+        try:
+            import google.generativeai as genai  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "google-generativeai package is required for Gemini. "
+                "Install with `pip install google-generativeai`."
+            ) from exc
+        genai.configure(api_key=cfg.gemini_api_key)
+        cfg._ai_client = genai.GenerativeModel(
+            model_name=cfg.gemini_model,
+            system_instruction=AI_SYSTEM_PROMPT,
+        )
+
+    resp = cfg._ai_client.generate_content(
+        user_prompt,
+        generation_config={
+            "temperature": 0.3,
+            "response_mime_type": "application/json",
+        },
+    )
+    # Gemini SDK exposes .text; fall back to candidates if blocked/empty.
+    text = getattr(resp, "text", None)
+    if text:
+        return text
+    candidates = getattr(resp, "candidates", None) or []
+    for cand in candidates:
+        parts = getattr(getattr(cand, "content", None), "parts", None) or []
+        for p in parts:
+            t = getattr(p, "text", None)
+            if t:
+                return t
+    return ""
+
+
+_PROVIDER_DISPATCH = {
+    "openai": _call_openai,
+    "gemini": _call_gemini,
+    "groq": _call_groq,
+}
+
+
 def analyze_with_ai(cfg: Config, topic: Topic, details: dict[str, Any] | None) -> dict[str, Any]:
     user_prompt = _build_user_prompt(topic, details)
     body_preview = _extract_first_post(details)[0] if details else (topic.excerpt or "")
+    call = _PROVIDER_DISPATCH[cfg.ai_provider]
     last_error = "unknown"
 
     for attempt in (1, 2):
         try:
-            resp = cfg.openai.chat.completions.create(
-                model=cfg.openai_model,
-                messages=[
-                    {"role": "system", "content": AI_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.3,
-            )
-            content = resp.choices[0].message.content or ""
+            content = call(cfg, user_prompt)
             parsed = _parse_ai_json(content)
             if parsed and parsed.get("summary"):
                 urgency = parsed.get("urgency", "Low")
@@ -451,11 +567,12 @@ def analyze_with_ai(cfg: Config, topic: Topic, details: dict[str, Any] | None) -
                     parsed["urgency"] = "Low"
                 return parsed
             last_error = "JSON inválido retornado pelo modelo"
-            log.warning("AI returned unparseable JSON on attempt %d: %s",
-                        attempt, content[:300])
-        except Exception as exc:  # broad: OpenAI lib can raise many subclasses
+            log.warning("[%s] AI returned unparseable JSON on attempt %d: %s",
+                        cfg.ai_provider, attempt, (content or "")[:300])
+        except Exception as exc:  # broad: every SDK raises its own classes
             last_error = f"{type(exc).__name__}: {exc}"
-            log.error("AI call failed (attempt %d): %s", attempt, last_error)
+            log.error("[%s] AI call failed (attempt %d): %s",
+                      cfg.ai_provider, attempt, last_error)
             time.sleep(2)
 
     return _fallback_analysis(topic, body_preview, last_error)

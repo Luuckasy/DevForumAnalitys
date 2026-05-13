@@ -29,8 +29,13 @@ The first cycle will mark recent topics from the configured endpoints. Only item
 | Variable | Default | Description |
 |---|---|---|
 | `DISCORD_WEBHOOK_URL` | *(required)* | Discord webhook URL to post embeds to |
-| `OPENAI_API_KEY` | *(required)* | OpenAI API key |
+| `AI_PROVIDER` | `gemini` | Which AI to use: `openai`, `gemini`, or `groq` |
+| `OPENAI_API_KEY` | *(required if `AI_PROVIDER=openai`)* | OpenAI API key |
 | `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI chat model |
+| `GEMINI_API_KEY` | *(required if `AI_PROVIDER=gemini`)* | Google AI Studio API key |
+| `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model |
+| `GROQ_API_KEY` | *(required if `AI_PROVIDER=groq`)* | Groq API key |
+| `GROQ_MODEL` | `llama-3.1-8b-instant` | Groq model |
 | `CHECK_INTERVAL_MINUTES` | `10` | Polling interval in minutes |
 | `DEVFORUM_BASE_URL` | `https://devforum.roblox.com` | Base URL |
 | `MONITORED_ENDPOINTS` | `/latest.json` | Comma-separated Discourse JSON endpoints |
@@ -42,6 +47,33 @@ The first cycle will mark recent topics from the configured endpoints. Only item
 | `DATABASE_PATH` | `./data/devforum_bot.sqlite3` | SQLite file path |
 | `PORT` | `8080` | Port for the healthcheck HTTP server |
 | `HEALTHCHECK` | `1` | Set to `0` to disable the healthcheck server |
+
+## AI providers
+
+The bot can talk to three different APIs. Pick one with `AI_PROVIDER` and set the matching `*_API_KEY`. Only the key for the selected provider is required — the other key fields can stay empty.
+
+| Provider | Get a key | Default model | JSON mode | Why pick it |
+|---|---|---|---|---|
+| `gemini` (**default**) | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | `gemini-2.0-flash` | yes (`response_mime_type=application/json`) | Generous free tier — start here. |
+| `groq` | [console.groq.com/keys](https://console.groq.com/keys) | `llama-3.1-8b-instant` | yes (OpenAI-compatible) | Very fast, free tier with rate limits, Llama models. |
+| `openai` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) | `gpt-4o-mini` | yes | Highest quality output, requires paid quota. |
+
+All three return the same JSON schema:
+
+```json
+{
+  "summary": "...",
+  "context": "...",
+  "impact": "...",
+  "recommended_action": "...",
+  "urgency": "Low | Medium | High | Critical",
+  "developer_notes": "..."
+}
+```
+
+If the model returns broken JSON the bot retries once. If the API itself fails (auth, quota, rate limit, network), the bot posts a fallback embed whose **Notas técnicas** field contains the real error class and message — so you can tell apart `AuthenticationError`, `RateLimitError: insufficient_quota`, `NotFoundError: model ... not found`, etc. without digging through logs.
+
+To switch providers at runtime, change `AI_PROVIDER` in Railway → Variables and redeploy. No code change needed.
 
 ## Deploying on Railway
 
